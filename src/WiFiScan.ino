@@ -217,6 +217,73 @@ void callback(char* topic, byte* payload, unsigned int length) {
             }
         }
         
+        // **********************************************
+        // ******* เพิ่มส่วนควบคุมระดับพัดลมตรงนี้ *******
+        // **********************************************
+        else if (payloadStr.indexOf("setFanLevel") > 0) {
+            // String Parsing สำหรับ {"method":"setFanLevel","params":1} (0:Auto, 1:LOW, 2:MID, 3:HIGH)
+            int fanIndex = payloadStr.lastIndexOf(':') + 1;
+            int endFanIndex = payloadStr.lastIndexOf('}');
+            String fanStr = payloadStr.substring(fanIndex, endFanIndex);
+            int newFanLevel = fanStr.toInt();
+            
+            // ตรวจสอบค่าที่ถูกต้อง (0 ถึง 3)
+            if (newFanLevel >= 0 && newFanLevel <= 3) {
+                fanLevel = newFanLevel;
+                Serial.print("RPC SUCCESS: Fan Level set to ");
+                Serial.println(fanLevel);
+                updateDisplay();
+                sendTelemetry();
+            } else {
+                Serial.println("RPC ERROR: Invalid fan level.");
+            }
+        }
+        
+        // **********************************************
+        // ******* เพิ่มส่วนควบคุมสถานะเปิด/ปิดตรงนี้ *****
+        // **********************************************
+        else if (payloadStr.indexOf("setPowerStatus") > 0) {
+            // String Parsing สำหรับ {"method":"setPowerStatus","params":true} หรือ {"method":"setPowerStatus","params":false}
+            int paramsIndex = payloadStr.lastIndexOf(':') + 1;
+            int endParamsIndex = payloadStr.lastIndexOf('}');
+            String paramsStr = payloadStr.substring(paramsIndex, endParamsIndex);
+            
+            // แปลงค่า paramsStr เป็น boolean
+            bool newPowerStatus = false;
+            if (paramsStr.indexOf("true") > 0) {
+                newPowerStatus = true;
+            } else if (paramsStr.indexOf("false") > 0) {
+                newPowerStatus = false;
+            } else {
+                Serial.println("RPC ERROR: Invalid power status parameter.");
+                // ตอบกลับเฉพาะคำสั่งที่ถูกต้องเท่านั้น เพื่อไม่ให้เกิด Error บน ThingsBoard
+            }
+
+            if (powerOn != newPowerStatus) {
+                powerOn = newPowerStatus;
+                
+                if (powerOn) {
+                    Serial.println("RPC SUCCESS: Starting Up...");
+                    // โหมดเปิด
+                    showSplashScreen(); // แสดง splash screen เมื่อเปิดเครื่อง
+                    updateWifiSignal();
+                } else {
+                    // โหมดปิด
+                    compressorControl(); // ตรวจสอบ/ปิดคอมเพรสเซอร์ทันที
+                    display.clearDisplay();
+                    display.display();
+                    Serial.println("RPC SUCCESS: Shutting Down...");
+                }
+                
+                // อัปเดตสถานะและส่ง Telemetry
+                compressorControl(); 
+                updateDisplay(); 
+                sendTelemetry();
+            } else {
+                Serial.println("RPC: Power status already set.");
+            }
+        }
+        
         // ตอบกลับ (สำคัญมากสำหรับ RPC Widget บน ThingsBoard)
         String responseTopic = "v1/devices/me/rpc/response/" + requestId;
         client.publish(responseTopic.c_str(), "{\"status\":\"ok\"}");
