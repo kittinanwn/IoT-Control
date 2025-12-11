@@ -4,10 +4,27 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <WiFi.h>
+#include <PubSubClient.h> 
 
 // ---- WiFi Settings ----
 const char* ssid = "RMUTI-IoT";
 const char* password = "IoT@RMUTI";
+
+// ----------------- ThingsBoard Settings -----------------
+#define TOKEN_TB "tpnd8vfvtoj20r927uhs" // Access Token ของคุณ
+const char* mqtt_server = "iot-so.rmuti.ac.th"; 
+const int mqtt_port = 1883;
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// ----------------- Data Topics -----------------
+const char* TB_TELEMETRY_TOPIC = "v1/devices/me/telemetry";
+const char* TB_RPC_TOPIC_REQUEST = "v1/devices/me/rpc/request/+"; // สำหรับรับคำสั่ง RPC
+
+// ----------------- Time Tracking -----------------
+unsigned long lastTBMillis = 0;
+const unsigned long tbInterval = 60000; // ส่งข้อมูลทุก 60 วินาที
 
 // ---- OLED Display Settings ----
 #define SCREEN_WIDTH 128
@@ -24,8 +41,10 @@ OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 
 // ---- Compressor Control ----
-#define COMPRESSOR_PIN 25 // <<< กำหนดขาสำหรับควบคุมรีเลย์คอมเพรสเซอร์
-bool compressorOn = false; // <<< ตัวแปรสถานะคอมเพรสเซอร์
+#define COMPRESSOR_PIN 25 
+bool compressorOn = false; 
+unsigned long lastCompressorOffTime = 0;
+const unsigned long MIN_OFF_TIME = 300000; // 5 นาที 
 
 // ---- Buttons ----
 const uint8_t buttonPins[] = {2, 8, 9, 21, 20};
@@ -39,7 +58,6 @@ const unsigned long debounceDelay = 50;
 
 // ---- System States ----
 int mode = 0; // 0: COOL, 1: FAN
-bool fanOn = false;
 int fanLevel = 0; // 0: Auto, 1: LOW, 2: MID, 3: HIGH
 bool powerOn = true;
 float currentTemp = 0.0;
@@ -55,20 +73,25 @@ int wifiBars = 0;
 unsigned long lastWifiCheck = 0;
 const unsigned long wifiCheckInterval = 5000;
 
+// ** Forward Declaration **
+void sendTelemetry();
+void updateDisplay();
+void compressorControl();
+
+
 // ฟังก์ชันคำนวณขีดสัญญาณ
 void updateWifiSignal() {
     if (WiFi.status() != WL_CONNECTED) {
         wifiBars = 0;
-        return;
+    } else {
+        rssi = WiFi.RSSI();
+        if (rssi > -55) wifiBars = 4;
+        else if (rssi > -65) wifiBars = 3;
+        else if (rssi > -75) wifiBars = 2;
+        else if (rssi > -85) wifiBars = 1;
+        else wifiBars = 0;
     }
-    rssi = WiFi.RSSI();
-    if (rssi > -55) wifiBars = 4;
-    else if (rssi > -65) wifiBars = 3;
-    else if (rssi > -75) wifiBars = 2;
-    else if (rssi > -85) wifiBars = 1;
-    else wifiBars = 0;
 }
-// test
 
 // ฟังก์ชันวาดไอคอน WiFi บนจอ
 void drawWifiIcon() {
@@ -125,14 +148,110 @@ void showSplashScreen() {
     display.clearDisplay();
 }
 
-// ---------- Function: Compressor Control (ใหม่) ----------
-// ---- Compressor Time Tracking ----
-unsigned long lastCompressorOffTime = 0;
-const unsigned long MIN_OFF_TIME = 300000; // 5 นาที = 300,000 มิลลิวินาที
+// 📤 ฟังก์ชัน: ส่งข้อมูล Telemetry ไปยัง ThingsBoard
+void sendTelemetry() {
+    if (!client.connected()) {
+        return;
+    }
+    
+    // สร้าง Payload แบบ JSON
+    String payload = "{";
+    payload += "\"currentTemp\":" + String(currentTemp, 1) + ",";
+    payload += "\"targetTemp\":" + String(targetTemp) + ",";
+    payload += "\"powerOn\":" + String(powerOn ? "true" : "false") + ",";
+    payload += "\"compressorOn\":" + String(compressorOn ? "true" : "false") + ",";
+    payload += "\"mode\":\"" + (String(mode == 0 ? "COOL" : "FAN")) + "\",";
+    
+    String fanStr;
+    if (fanLevel == 0) fanStr = "Auto";
+    else if (fanLevel == 1) fanStr = "LOW";
+    else if (fanLevel == 2) fanStr = "MID";
+    else if (fanLevel == 3) fanStr = "HIGH";
+    
+    payload += "\"fanLevel\":\"" + fanStr + "\",";
+    
+    // เพิ่มข้อมูล WiFi
+    payload += "\"rssi\":" + String(rssi) + ",";
+    payload += "\"wifiBars\":" + String(wifiBars) + "";
+
+    payload += "}";
+
+    // Publish ข้อมูล
+    client.publish(TB_TELEMETRY_TOPIC, payload.c_str());
+}
+
+// 🚀 ฟังก์ชัน: จัดการเมื่อได้รับข้อความ MQTT (Callback)
+void callback(char* topic, byte* payload, unsigned int length) {
+    Serial.print("Message arrived [");
+    Serial.print(topic);
+    Serial.print("] ");
+    
+    String payloadStr;
+    for (int i = 0; i < length; i++) {
+        payloadStr += (char)payload[i];
+    }
+    Serial.println(payloadStr);
+
+    // ตรวจสอบว่าเป็นคำสั่ง RPC หรือไม่
+    if (String(topic).startsWith("v1/devices/me/rpc/request/")) {
+        
+        String topicStr = String(topic);
+        String requestId = topicStr.substring(topicStr.lastIndexOf('/') + 1);
+        
+        if (payloadStr.indexOf("setTemperature") > 0) {
+            // String Parsing สำหรับ {"method":"setTemperature","params":22}
+            int tempIndex = payloadStr.lastIndexOf(':') + 1;
+            int endTempIndex = payloadStr.lastIndexOf('}');
+            String tempStr = payloadStr.substring(tempIndex, endTempIndex);
+            int newTargetTemp = tempStr.toInt();
+            
+            if (newTargetTemp >= 18 && newTargetTemp <= 30) {
+                targetTemp = newTargetTemp;
+                Serial.print("RPC SUCCESS: Target Temp set to ");
+                Serial.println(targetTemp);
+                compressorControl();
+                updateDisplay();
+                sendTelemetry();
+            } else {
+                Serial.println("RPC ERROR: Invalid target temperature.");
+            }
+        }
+        
+        // ตอบกลับ (สำคัญมากสำหรับ RPC Widget บน ThingsBoard)
+        String responseTopic = "v1/devices/me/rpc/response/" + requestId;
+        client.publish(responseTopic.c_str(), "{\"status\":\"ok\"}");
+    }
+}
+
+
+// 🚀 ฟังก์ชัน: เชื่อมต่อ/เชื่อมต่อใหม่กับ ThingsBoard
+void reconnectThingsBoard() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    
+    Serial.println("Attempting MQTT connection to ThingsBoard...");
+
+    while (!client.connected() && WiFi.status() == WL_CONNECTED) {
+        if (client.connect("ESP32_AC_Control", TOKEN_TB, NULL)) {
+            Serial.println("Connected to ThingsBoard!");
+            
+            client.subscribe(TB_RPC_TOPIC_REQUEST); // Subscribe RPC Request
+            Serial.println("Subscribed to RPC topic.");
+            
+            sendTelemetry(); // ส่งสถานะเริ่มต้น
+        } else {
+            Serial.print("Failed, rc=");
+            Serial.print(client.state());
+            Serial.println(" Try again in 5 seconds");
+            delay(5000);
+        }
+    }
+}
+
 
 // 🚀 ฟังก์ชัน: ควบคุมคอมเพรสเซอร์ พร้อมหน่วงเวลา 5 นาที
 void compressorControl() {
     unsigned long now = millis();
+    bool oldCompressorOn = compressorOn;
 
     // 1. ตรวจสอบเงื่อนไขพื้นฐาน: ต้องเปิดเครื่อง และอยู่ในโหมด COOL
     if (!powerOn || mode != 0) { // mode 0 คือ COOL
@@ -142,44 +261,43 @@ void compressorControl() {
             lastCompressorOffTime = now; // บันทึกเวลาที่ปิด
             Serial.println("Compressor OFF (System Conditions)");
         }
+        if (oldCompressorOn != compressorOn) sendTelemetry(); 
         return;
     }
 
     // 2. ตรวจสอบอุณหภูมิและสถานะเซ็นเซอร์
-    float hysteresis = 0.5; // ค่า Hysteresis 0.5 องศาเซลเซียส
+    float hysteresis = 0.5; 
 
     if (currentTemp == 0.0 || currentTemp <= -100.0) {
-        return; // งดการควบคุมถ้าวัดอุณหภูมิไม่ได้
+        return; 
     }
 
     if (!compressorOn) {
         // ---- เงื่อนไขเปิด (ต้องตรวจสอบเวลาหน่วง) ----
-
-        // 2.1 ตรวจสอบเวลาหน่วง: ต้องรอให้พ้นช่วง MIN_OFF_TIME ก่อน
         if (lastCompressorOffTime > 0 && (now - lastCompressorOffTime < MIN_OFF_TIME)) {
-            Serial.print("Compressor WAIT: ");
-            Serial.print((MIN_OFF_TIME - (now - lastCompressorOffTime)) / 1000);
-            Serial.println("s remaining.");
-            return; // หน่วงเวลาอยู่ ไม่อนุญาตให้เปิด
+            return; 
         }
 
-        // 2.2 เงื่อนไขอุณหภูมิเปิด: อุณหภูมิปัจจุบันสูงกว่าอุณหภูมิเป้าหมาย + Hysteresis
+        // เงื่อนไขอุณหภูมิเปิด: อุณหภูมิปัจจุบันสูงกว่าอุณหภูมิเป้าหมาย + Hysteresis
         if (currentTemp > targetTemp + hysteresis) {
-            digitalWrite(COMPRESSOR_PIN, HIGH); // เปิดคอมเพรสเซอร์ (สมมติ Active-HIGH)
+            digitalWrite(COMPRESSOR_PIN, HIGH); // เปิดคอมเพรสเซอร์
             compressorOn = true;
             Serial.println("Compressor ON");
-            lastCompressorOffTime = 0; // รีเซ็ตเวลาปิด เพราะเปิดแล้ว
+            lastCompressorOffTime = 0; 
         }
     } else {
-        // ---- เงื่อนไขปิด ----
-
         // เงื่อนไขปิด: อุณหภูมิปัจจุบันถึงหรือต่ำกว่าอุณหภูมิเป้าหมาย
         if (currentTemp <= targetTemp) {
             digitalWrite(COMPRESSOR_PIN, LOW); // ปิดคอมเพรสเซอร์
             compressorOn = false;
-            lastCompressorOffTime = now; // บันทึกเวลาที่ปิด
+            lastCompressorOffTime = now; 
             Serial.println("Compressor OFF (Target Reached)");
         }
+    }
+    
+    // ส่งข้อมูลไป ThingsBoard เมื่อสถานะคอมเพรสเซอร์เปลี่ยน
+    if (oldCompressorOn != compressorOn) {
+        sendTelemetry(); 
     }
 }
 
@@ -269,22 +387,21 @@ void handleButtonPress(uint8_t idx) {
     if (!powerOn && idx != 2) {
         return;
     }
+    
+    bool stateChanged = true;
 
     switch (idx) {
         case 0: // Mode
             mode = (mode + 1) % 2;
-            compressorControl(); // อัปเดตสถานะคอมเพรสเซอร์ทันทีเมื่อเปลี่ยนโหมด
-            updateDisplay();
+            compressorControl(); 
             break;
         case 1: // Fan
             fanLevel = (fanLevel + 1) % 4;
-            compressorControl(); // อัปเดตสถานะคอมเพรสเซอร์ทันทีเมื่อเปลี่ยนระดับพัดลม
-            updateDisplay();
             break;
         case 2: // Power
             if (powerOn) {
                 powerOn = false;
-                compressorControl(); // ปิดคอมเพรสเซอร์ทันทีที่ปิดเครื่อง
+                compressorControl(); 
                 Serial.println("Shutting Down...");
                 display.clearDisplay();
                 display.display();
@@ -293,8 +410,7 @@ void handleButtonPress(uint8_t idx) {
                 Serial.println("Starting Up...");
                 showSplashScreen();
                 updateWifiSignal();
-                compressorControl(); // ตรวจสอบสถานะคอมเพรสเซอร์เมื่อเปิดเครื่อง
-                updateDisplay();
+                compressorControl(); 
             }
             break;
         case 3: // Temp+
@@ -303,8 +419,7 @@ void handleButtonPress(uint8_t idx) {
             Serial.print("Set Temp: ");
             Serial.println(targetTemp);
             Serial1.println("Temp+");
-            compressorControl(); // อัปเดตสถานะคอมเพรสเซอร์ทันทีเมื่อเปลี่ยนอุณหภูมิเป้าหมาย
-            updateDisplay();
+            compressorControl(); 
             break;
         case 4: // Temp-
             targetTemp--;
@@ -312,9 +427,17 @@ void handleButtonPress(uint8_t idx) {
             Serial.print("Set Temp: ");
             Serial.println(targetTemp);
             Serial1.println("Temp-");
-            compressorControl(); // อัปเดตสถานะคอมเพรสเซอร์ทันทีเมื่อเปลี่ยนอุณหภูมิเป้าหมาย
-            updateDisplay(); 
+            compressorControl(); 
             break;
+        default:
+            stateChanged = false;
+    }
+    
+    if (stateChanged && powerOn) {
+        updateDisplay();
+        sendTelemetry(); 
+    } else if (idx == 2) {
+        sendTelemetry();
     }
 }
 
@@ -339,9 +462,7 @@ void scanButtons() {
             } else {
                 if (buttonState[i] == LOW && (now - lastButtonHeldReport[i] >= heldReportInterval)) {
                     if (powerOn || i == 2) {
-                        if (i == 3 || i == 4) handleButtonPress(i); // Auto increase/decrease
-                        Serial.print(buttonNames[i]);
-                        Serial.println(" HELD");
+                        if (i == 3 || i == 4) handleButtonPress(i); 
                         lastButtonHeldReport[i] = now;
                     }
                 }
@@ -353,18 +474,16 @@ void scanButtons() {
 
 // ---------- Setup ----------
 void setup() {
-    Serial.begin(115200, SERIAL_8N1, -1, -1);
+    Serial.begin(115200);
     Serial1.begin(9600, SERIAL_8N1, 3, 10);
     Wire.begin(I2C_SDA, I2C_SCL);
 
-    // กำหนดขาปุ่มเป็น INPUT_PULLUP (หากปุ่มต่อกับ GND)
     for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
         pinMode(buttonPins[i], INPUT_PULLUP);
     }
     
-    // กำหนดขาคอมเพรสเซอร์เป็น OUTPUT
     pinMode(COMPRESSOR_PIN, OUTPUT);
-    digitalWrite(COMPRESSOR_PIN, LOW); // ปิดคอมเพรสเซอร์เริ่มต้น
+    digitalWrite(COMPRESSOR_PIN, LOW); 
 
     if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
         Serial.println(F("SSD1306 allocation failed"));
@@ -375,12 +494,21 @@ void setup() {
     WiFi.begin(ssid, password);
     showSplashScreen();
     
+    // Setup ThingsBoard Client
+    client.setServer(mqtt_server, mqtt_port);
+    client.setCallback(callback); // ตั้งค่า Callback สำหรับ RPC
+
     powerOn = true;
     sensors.begin();
     
     updateWifiSignal();
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      reconnectThingsBoard();
+    }
+
     updateDisplay();
-    compressorControl(); // ตรวจสอบสถานะคอมเพรสเซอร์เริ่มต้น
+    compressorControl(); 
     
     Serial.println("System Ready");
 }
@@ -388,8 +516,16 @@ void setup() {
 // ---------- Loop ----------
 void loop() {
     unsigned long now = millis();
+    
+    // 1. ตรวจสอบการเชื่อมต่อ WiFi และ MQTT
+    if (WiFi.status() == WL_CONNECTED) {
+        if (!client.connected()) {
+            reconnectThingsBoard();
+        }
+        client.loop(); // ต้องเรียกใช้เสมอเพื่อรับคำสั่ง RPC
+    }
 
-    // 1. อ่านอุณหภูมิ (DS18B20)
+    // 2. อ่านอุณหภูมิ (DS18B20)
     if (powerOn && (now - lastTempMillis >= tempInterval)) {
         lastTempMillis = now;
         sensors.requestTemperatures();
@@ -397,16 +533,29 @@ void loop() {
         
         if (tempReading > -100.0 && tempReading != 0.0) {
             currentTemp = tempReading;
-            compressorControl(); // <<< เรียกใช้การควบคุมคอมเพรสเซอร์เมื่อได้ค่าอุณหภูมิใหม่
+            compressorControl(); 
         }
         updateDisplay();
+        
+        // ส่ง Telemetry ทันทีที่มีการอ่านอุณหภูมิใหม่
+        sendTelemetry();
+    }
+    
+    // 3. ส่งข้อมูลไปยัง ThingsBoard ตามช่วงเวลา (60 วินาที)
+    if (powerOn && client.connected() && (now - lastTBMillis >= tbInterval)) {
+        lastTBMillis = now;
+        sendTelemetry();
     }
 
-    // 2. เช็ค WiFi
+    // 4. เช็ค WiFi และส่งข้อมูล (5 วินาที)
     if (powerOn && (now - lastWifiCheck >= wifiCheckInterval)) {
         lastWifiCheck = now;
         updateWifiSignal();
         updateDisplay();
+        
+        if (client.connected()) {
+            sendTelemetry(); // ส่งข้อมูล RSSI และสถานะอื่น ๆ ที่อัปเดตแล้ว
+        }
     }
 
     scanButtons();
