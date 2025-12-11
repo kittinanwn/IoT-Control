@@ -67,6 +67,7 @@ void updateWifiSignal() {
     else if (rssi > -75) wifiBars = 2;
     else if (rssi > -85) wifiBars = 1;
     else wifiBars = 0;
+    // 888
 }
 // test
 
