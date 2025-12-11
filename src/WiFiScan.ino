@@ -113,30 +113,71 @@ void drawWifiIcon() {
     }
 }
 
-// ---------- Function: Show Splash Screen (Non-Blocking) ----------
+
 void showSplashScreen() {
+
     display.clearDisplay();
+
     display.setTextSize(2);
+
     display.setTextColor(SSD1306_WHITE);
+
     display.setCursor(10, 10);
+
     display.println(F("AC SYSTEM"));
+
     display.setTextSize(1);
+
     display.setCursor(20, 30);
+
     if (WiFi.status() == WL_CONNECTED) {
+
         display.println(F("WiFi Connected"));
+
     } else {
+
         display.println(F("Connecting WiFi.."));
+
     }
+
     display.display();
 
+
+
     if (WiFi.status() != WL_CONNECTED) {
+
         WiFi.begin(ssid, password);
+
     }
-    
-    // *** ลบโค้ด Blocking ทั้งหมดออก ***
-    // (พวก for loop สร้าง bar และ delay)
-    
-    display.clearDisplay(); 
+
+    int barWidth = 100;
+
+    int barHeight = 10;
+
+    int barX = (SCREEN_WIDTH - barWidth) / 2;
+
+    int barY = 45;
+
+    display.drawRect(barX, barY, barWidth, barHeight, SSD1306_WHITE);
+
+
+
+    for (int i = 0; i <= 100; i += 5) {
+
+        int currentWidth = map(i, 0, 100, 0, barWidth - 4);
+
+        display.fillRect(barX + 2, barY + 2, currentWidth, barHeight - 4, SSD1306_WHITE);
+
+        display.display();
+
+        delay(10);
+
+    }
+
+    delay(300);
+
+    display.clearDisplay();
+
 }
 
 // 📤 ฟังก์ชัน: ส่งข้อมูล Telemetry ไปยัง ThingsBoard
