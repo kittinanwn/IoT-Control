@@ -68,6 +68,7 @@ void updateWifiSignal() {
     else if (rssi > -85) wifiBars = 1;
     else wifiBars = 0;
 }
+// test
 
 // ฟังก์ชันวาดไอคอน WiFi บนจอ
 void drawWifiIcon() {
