@@ -113,7 +113,7 @@ void drawWifiIcon() {
     }
 }
 
-// ---------- Function: Show Splash Screen ----------
+// ---------- Function: Show Splash Screen (Non-Blocking) ----------
 void showSplashScreen() {
     display.clearDisplay();
     display.setTextSize(2);
@@ -132,25 +132,17 @@ void showSplashScreen() {
     if (WiFi.status() != WL_CONNECTED) {
         WiFi.begin(ssid, password);
     }
-    int barWidth = 100;
-    int barHeight = 10;
-    int barX = (SCREEN_WIDTH - barWidth) / 2;
-    int barY = 45;
-    display.drawRect(barX, barY, barWidth, barHeight, SSD1306_WHITE);
-
-    for (int i = 0; i <= 100; i += 5) {
-        int currentWidth = map(i, 0, 100, 0, barWidth - 4);
-        display.fillRect(barX + 2, barY + 2, currentWidth, barHeight - 4, SSD1306_WHITE);
-        display.display();
-        delay(10);
-    }
-    delay(300);
-    display.clearDisplay();
+    
+    // *** ลบโค้ด Blocking ทั้งหมดออก ***
+    // (พวก for loop สร้าง bar และ delay)
+    
+    display.clearDisplay(); 
 }
 
 // 📤 ฟังก์ชัน: ส่งข้อมูล Telemetry ไปยัง ThingsBoard
 void sendTelemetry() {
-    if (!client.connected()) {
+    // ส่งข้อมูล Telemetry เฉพาะเมื่อเชื่อมต่อ MQTT และเปิดเครื่องเท่านั้น
+    if (!client.connected() && powerOn) {
         return;
     }
     
@@ -177,7 +169,9 @@ void sendTelemetry() {
     payload += "}";
 
     // Publish ข้อมูล
-    client.publish(TB_TELEMETRY_TOPIC, payload.c_str());
+    if (client.connected()) {
+        client.publish(TB_TELEMETRY_TOPIC, payload.c_str());
+    }
 }
 
 // 🚀 ฟังก์ชัน: จัดการเมื่อได้รับข้อความ MQTT (Callback)
@@ -198,6 +192,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
         String topicStr = String(topic);
         String requestId = topicStr.substring(topicStr.lastIndexOf('/') + 1);
         
+        // 1. setTemperature
         if (payloadStr.indexOf("setTemperature") > 0) {
             // String Parsing สำหรับ {"method":"setTemperature","params":22}
             int tempIndex = payloadStr.lastIndexOf(':') + 1;
@@ -217,17 +212,14 @@ void callback(char* topic, byte* payload, unsigned int length) {
             }
         }
         
-        // **********************************************
-        // ******* เพิ่มส่วนควบคุมระดับพัดลมตรงนี้ *******
-        // **********************************************
+        // 2. setFanLevel
         else if (payloadStr.indexOf("setFanLevel") > 0) {
-            // String Parsing สำหรับ {"method":"setFanLevel","params":1} (0:Auto, 1:LOW, 2:MID, 3:HIGH)
+            // String Parsing สำหรับ {"method":"setFanLevel","params":1}
             int fanIndex = payloadStr.lastIndexOf(':') + 1;
             int endFanIndex = payloadStr.lastIndexOf('}');
             String fanStr = payloadStr.substring(fanIndex, endFanIndex);
             int newFanLevel = fanStr.toInt();
             
-            // ตรวจสอบค่าที่ถูกต้อง (0 ถึง 3)
             if (newFanLevel >= 0 && newFanLevel <= 3) {
                 fanLevel = newFanLevel;
                 Serial.print("RPC SUCCESS: Fan Level set to ");
@@ -239,43 +231,36 @@ void callback(char* topic, byte* payload, unsigned int length) {
             }
         }
         
-        // **********************************************
-        // ******* เพิ่มส่วนควบคุมสถานะเปิด/ปิดตรงนี้ *****
-        // **********************************************
+        // 3. setPowerStatus (RPC Handler)
         else if (payloadStr.indexOf("setPowerStatus") > 0) {
-            // String Parsing สำหรับ {"method":"setPowerStatus","params":true} หรือ {"method":"setPowerStatus","params":false}
+            // String Parsing สำหรับ {"method":"setPowerStatus","params":true}
             int paramsIndex = payloadStr.lastIndexOf(':') + 1;
             int endParamsIndex = payloadStr.lastIndexOf('}');
             String paramsStr = payloadStr.substring(paramsIndex, endParamsIndex);
             
-            // แปลงค่า paramsStr เป็น boolean
             bool newPowerStatus = false;
             if (paramsStr.indexOf("true") > 0) {
                 newPowerStatus = true;
             } else if (paramsStr.indexOf("false") > 0) {
                 newPowerStatus = false;
-            } else {
-                Serial.println("RPC ERROR: Invalid power status parameter.");
-                // ตอบกลับเฉพาะคำสั่งที่ถูกต้องเท่านั้น เพื่อไม่ให้เกิด Error บน ThingsBoard
-            }
+            } 
 
             if (powerOn != newPowerStatus) {
                 powerOn = newPowerStatus;
                 
                 if (powerOn) {
                     Serial.println("RPC SUCCESS: Starting Up...");
-                    // โหมดเปิด
-                    showSplashScreen(); // แสดง splash screen เมื่อเปิดเครื่อง
+                    showSplashScreen();
                     updateWifiSignal();
+                    // ไม่มีการเรียก Blocking Functions
                 } else {
-                    // โหมดปิด
-                    compressorControl(); // ตรวจสอบ/ปิดคอมเพรสเซอร์ทันที
+                    // โหมดปิด: ไม่ตัดการเชื่อมต่อ MQTT
+                    compressorControl();
                     display.clearDisplay();
                     display.display();
                     Serial.println("RPC SUCCESS: Shutting Down...");
                 }
                 
-                // อัปเดตสถานะและส่ง Telemetry
                 compressorControl(); 
                 updateDisplay(); 
                 sendTelemetry();
@@ -285,32 +270,31 @@ void callback(char* topic, byte* payload, unsigned int length) {
         }
         
         // ตอบกลับ (สำคัญมากสำหรับ RPC Widget บน ThingsBoard)
+        // ต้องตอบกลับเร็วที่สุดเพื่อให้ ThingsBoard ไม่เกิด Request Timeout
         String responseTopic = "v1/devices/me/rpc/response/" + requestId;
         client.publish(responseTopic.c_str(), "{\"status\":\"ok\"}");
     }
 }
 
 
-// 🚀 ฟังก์ชัน: เชื่อมต่อ/เชื่อมต่อใหม่กับ ThingsBoard
+// 🚀 ฟังก์ชัน: เชื่อมต่อ/เชื่อมต่อใหม่กับ ThingsBoard (Non-Blocking)
 void reconnectThingsBoard() {
     if (WiFi.status() != WL_CONNECTED) return;
     
     Serial.println("Attempting MQTT connection to ThingsBoard...");
 
-    while (!client.connected() && WiFi.status() == WL_CONNECTED) {
-        if (client.connect("ESP32_AC_Control", TOKEN_TB, NULL)) {
-            Serial.println("Connected to ThingsBoard!");
-            
-            client.subscribe(TB_RPC_TOPIC_REQUEST); // Subscribe RPC Request
-            Serial.println("Subscribed to RPC topic.");
-            
-            sendTelemetry(); // ส่งสถานะเริ่มต้น
-        } else {
-            Serial.print("Failed, rc=");
-            Serial.print(client.state());
-            Serial.println(" Try again in 5 seconds");
-            delay(5000);
-        }
+    // *** เปลี่ยนเป็น if ธรรมดา (Non-Blocking) ***
+    if (client.connect("ESP32_AC_Control", TOKEN_TB, NULL)) {
+        Serial.println("Connected to ThingsBoard!");
+        
+        client.subscribe(TB_RPC_TOPIC_REQUEST); // Subscribe RPC Request
+        Serial.println("Subscribed to RPC topic.");
+        
+        sendTelemetry(); // ส่งสถานะเริ่มต้น
+    } else {
+        Serial.print("Failed, rc=");
+        Serial.print(client.state());
+        Serial.println(" Trying again next loop.");
     }
 }
 
@@ -468,6 +452,9 @@ void handleButtonPress(uint8_t idx) {
         case 2: // Power
             if (powerOn) {
                 powerOn = false;
+                
+                // ไม่มีการตัดการเชื่อมต่อ MQTT/WiFi
+                
                 compressorControl(); 
                 Serial.println("Shutting Down...");
                 display.clearDisplay();
@@ -477,6 +464,9 @@ void handleButtonPress(uint8_t idx) {
                 Serial.println("Starting Up...");
                 showSplashScreen();
                 updateWifiSignal();
+                
+                // ไม่มีการเรียก reconnectThingsBoard()
+                
                 compressorControl(); 
             }
             break;
@@ -500,6 +490,7 @@ void handleButtonPress(uint8_t idx) {
             stateChanged = false;
     }
     
+    // ส่ง Telemetry สถานะ Power ทันที
     if (stateChanged && powerOn) {
         updateDisplay();
         sendTelemetry(); 
@@ -570,6 +561,7 @@ void setup() {
     
     updateWifiSignal();
     
+    // พยายามเชื่อมต่อครั้งแรก
     if (WiFi.status() == WL_CONNECTED) {
       reconnectThingsBoard();
     }
@@ -586,42 +578,48 @@ void loop() {
     
     // 1. ตรวจสอบการเชื่อมต่อ WiFi และ MQTT
     if (WiFi.status() == WL_CONNECTED) {
-        if (!client.connected()) {
+        // พยายามเชื่อมต่อใหม่เฉพาะเมื่อเปิดเครื่อง และยังไม่เชื่อมต่อ
+        if (!client.connected() && powerOn) { 
             reconnectThingsBoard();
         }
-        client.loop(); // ต้องเรียกใช้เสมอเพื่อรับคำสั่ง RPC
-    }
-
-    // 2. อ่านอุณหภูมิ (DS18B20)
-    if (powerOn && (now - lastTempMillis >= tempInterval)) {
-        lastTempMillis = now;
-        sensors.requestTemperatures();
-        float tempReading = sensors.getTempCByIndex(0);
-        
-        if (tempReading > -100.0 && tempReading != 0.0) {
-            currentTemp = tempReading;
-            compressorControl(); 
-        }
-        updateDisplay();
-        
-        // ส่ง Telemetry ทันทีที่มีการอ่านอุณหภูมิใหม่
-        sendTelemetry();
-    }
-    
-    // 3. ส่งข้อมูลไปยัง ThingsBoard ตามช่วงเวลา (60 วินาที)
-    if (powerOn && client.connected() && (now - lastTBMillis >= tbInterval)) {
-        lastTBMillis = now;
-        sendTelemetry();
-    }
-
-    // 4. เช็ค WiFi และส่งข้อมูล (5 วินาที)
-    if (powerOn && (now - lastWifiCheck >= wifiCheckInterval)) {
-        lastWifiCheck = now;
-        updateWifiSignal();
-        updateDisplay();
-        
         if (client.connected()) {
-            sendTelemetry(); // ส่งข้อมูล RSSI และสถานะอื่น ๆ ที่อัปเดตแล้ว
+            client.loop(); // ต้องเรียกใช้เสมอเพื่อรับคำสั่ง RPC
+        }
+    }
+
+    // ส่วนที่ทำงานเฉพาะเมื่อเปิดเครื่องเท่านั้น
+    if (powerOn) {
+        // 2. อ่านอุณหภูมิ (DS18B20)
+        if (now - lastTempMillis >= tempInterval) {
+            lastTempMillis = now;
+            sensors.requestTemperatures();
+            float tempReading = sensors.getTempCByIndex(0);
+            
+            if (tempReading > -100.0 && tempReading != 0.0) {
+                currentTemp = tempReading;
+                compressorControl(); 
+            }
+            updateDisplay();
+            
+            // ส่ง Telemetry ทันทีที่มีการอ่านอุณหภูมิใหม่
+            sendTelemetry();
+        }
+        
+        // 3. ส่งข้อมูลไปยัง ThingsBoard ตามช่วงเวลา (60 วินาที)
+        if (client.connected() && (now - lastTBMillis >= tbInterval)) {
+            lastTBMillis = now;
+            sendTelemetry();
+        }
+
+        // 4. เช็ค WiFi และส่งข้อมูล (5 วินาที)
+        if (now - lastWifiCheck >= wifiCheckInterval) {
+            lastWifiCheck = now;
+            updateWifiSignal();
+            updateDisplay();
+            
+            if (client.connected()) {
+                sendTelemetry(); // ส่งข้อมูล RSSI และสถานะอื่น ๆ ที่อัปเดตแล้ว
+            }
         }
     }
 
